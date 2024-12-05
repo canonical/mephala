@@ -1,5 +1,5 @@
-## Mephala
-# Security Update and Patch Management Infrastructure
+# Mephala, the Webspinner
+## Security Update and Patch Management Infrastructure
 
 Make sure to include a .gpt-conf with the following structure:
 
