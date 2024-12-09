@@ -6,10 +6,11 @@ import yaml
 
 class ContextManager(Agent):
 
-  def __init__(self, driver_conf="metadata.yaml", env_conf=".env-conf"):
+  def __init__(self, driver_conf="metadata.yaml", env_conf=".env-conf", mode='w'):
     Agent.__init__(self)
     self.driver_conf_path = os.path.join(self.ctx_dir, driver_conf)
     self.stored_metadata = self.load_metadata()
+    self.mode = mode
 
     with open(os.path.join(self.home_dir, env_conf), 'r') as f:
       conf = json.load(f)
@@ -25,6 +26,8 @@ class ContextManager(Agent):
     return self.yaml_file_to_dict(self.driver_conf_path)
       
   def save(self, key, value):
+    if self.mode == 'r':
+      raise Exception('*slaps hand away*')
     self.stored_metadata[key] = value
     self.save_metadata()
 
@@ -43,6 +46,9 @@ class ContextManager(Agent):
 
   def value_exists(self, key):
     return key in self.stored_metadata
+
+  def values_exist(self, *keys):
+    return all([key in self.stored_metadata for key in keys])
 
 def main():
   mgr = ContextManager()

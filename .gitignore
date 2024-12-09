@@ -1,1 +1,4 @@
 .gpt-conf
+__pycache__
+old_algos.py
+*.py.swp

@@ -14,33 +14,43 @@ import math
 from enum import Enum
 from itertools import islice
 import difflib
+from context import ContextManager
 
-#utils
-
-# How many lines of context a patch hunk expects. 
-CONTEXT_LENGTH = 3
-
-def str_match(str1, str2):
-  ldis = fuzz.ratio(str1, str2)
-  match ldis:
-    case _ if ldis >= 90:
-      return True
-    case _:
-      return False 
-
+class CVERecord:
+  def __init__(self, cve, desc):
+    self.cve = cve
+    self.desc = desc
+  def __str__(self):
+    return f'{self.cve}\n{self.desc}'
 
 # Naming convention for patches and stuff:
 # filename#hunk_index#candidate_id
 class Patch:
 
-  def __init__(self, patch_file, cve):
-    self.patch_file = patch_file
-    self.cve = cve
-    patch_name = patch_file.split('/')[-1]
+  def __init__(self, cve_record, release, path_to=None, fit_to=None):
+    self.cve_record = cve_record
+    self.release = release
+    self.path_to = path_to
+    self.hunks = {}
+    self.metadata = {}
 
-    self.hunks = {idx + 1: hunk for idx, hunk in enumerate(self.parse_patch(patch_file))}
+    if fit_to is not None:
+      self.transform(fit_to) 
 
-  def parse_patch(self, patch_path):
+  def __str__(self):
+    out = ''
+    for filename in self.hunks.keys():
+      out += f'--- {filename}\n+++ {filename}\n'
+      for hunk in self.hunks[filename]:
+        out += str(hunk)
+
+    return out
+
+  def with_metadata(self, metadata):
+    self.metadata = metadata
+    return self
+
+  def parse_patch(self):
     hunks = []
     #current_filename = None
     collecting_hunk = False  
@@ -49,7 +59,7 @@ class Patch:
     collecting_filenames = False
 
     converter = lambda line: '/'.join(line.split(' ')[1].split('/')[1:]).strip()
-    with open(patch_path, "r") as file:
+    with open(self.path_to, "r") as file:
       for line in file:
         # New hunk in a different file
         #if line.startswith('diff --git'):
@@ -86,10 +96,10 @@ class Patch:
     return hunks
 
   # Kind of an intense process. This method is written to manage a pipeline (and the reader's sanity).
-  # 1. We look for similarities between the hunks of the patch and the (potentially many) files  
-  def fit(self, source_dir, cve_text, metadata={}):
-    print(metadata)
-    for key, hunk in self.hunks.items():
+  def transform(self, other_patch):
+   
+    source_dir = ContextManager(mode='r').get_package_homes()[self.release] 
+    for idx, hunk in enumerate(other_patch.parse_patch(), 1): 
       delta = hunk.delta
       print('### DELTA ###')
       for line in delta:
@@ -109,86 +119,106 @@ class Patch:
         print(c.context_str())
 
       # 2. Perform semantic and syntactic analysis of possible fits, cross-referenced with the CVE description
-      selections = [str(sel) for sel in metadata.get(key) or self.semantic_pass(hunk, candidate_dict, cve_text)]
+      selections = [str(sel) for sel in other_patch.metadata.get(idx) or self.semantic_pass(hunk, candidate_dict, other_patch.cve_record)]
       
-      #d = difflib.Differ()
-      #for sel in selections:
-      #  candidate = candidate_dict[str(sel)]
-      #  print(candidate.context_str())
-      #  print(candidate.target_length)
-      #  diff = d.compare([ctx['line'] for _, ctx in candidate.context.items()], [dl.text for dl in delta])
-      #  print('\n'.join(diff))
-     
-      # 3. Actions
-      # action_dict = { sel: self.actions(hunk, candidate_dict[sel]) for sel in selections }
-        
       # 3. Actions
       actions = self.generate_actions(hunk)
 
-      # 4. Generate Alignments
-      alignment_dict = { sel: self.align_actions(actions, hunk, candidate_dict[sel]) for sel in selections }
+      print(actions)
+
+      # 4. Alignments
+      alignment_dict = { sel: self.create_alignments(actions, hunk, candidate_dict[sel]) for sel in selections }
 
       print(alignment_dict)
-      # TODO handle DELETIONS and INSERTIONS separately. insert is trivial compared to delete, which calls for like a "mapping" thing of lines 1..3 to 5.4 or smth
-      # 4. Weave
-      #for sel in selections:
-      #  
-      #  #self.weave(candidate_dict[sel], hunk)
-      #  #self.weave(candidate_dict[sel], hunk, action_dict[sel])
+
+      # 5. Threads
+      thread_dict = {
+        sel: sorted(
+          [{'action': action, 'interval': alignment_dict[sel][i]} for i, action in enumerate(actions)],
+          key=lambda thread: thread['interval'][0]	
+        ) for sel in selections
+      }
+      print(thread_dict)
  
-  def align_actions(self, actions, hunk, candidate):
+      # 6. Weave
+      fabric_dict = { sel: self.weave(candidate_dict[sel], thread_dict[sel]) for sel in selections }
+
+      # 7. Post-process Hunks
+      for k,v in fabric_dict.items():
+        print(k)
+        print(str(v))
+        if v.filename in self.hunks:
+          self.hunks[v.filename].append(v)
+        else:
+          self.hunks[v.filename] = [v]
+
+  def weave(self, candidate, threads):
+    fabric = Hunk(candidate.path_to)
+    ctx = candidate.context
+    line_no = list(ctx.keys())[0]
+    fabric.top = line_no
+    for thread in threads:
+      action = thread['action']
+      interval = thread['interval']
+      # We need to decide whether to insert a normal line, or do an action. This is based on whether an action has come up yet. 
+      while interval[0] != line_no:
+        fabric.delta.append(DiffLine(ctx[line_no]['line'], LineType.NOCHANGE))
+        line_no += 1
+
+      if len(interval) == 1:
+        fabric.delta.append(DiffLine(ctx[line_no]['line'], LineType.NOCHANGE))
+        for diff_line in action.lines:
+          fabric.delta.append(DiffLine(diff_line.text, LineType.INSERTION))
+        line_no += 1
+      else:
+        if interval[0] == interval[1]:
+          fabric.delta.append(DiffLine(ctx[interval[0]]['line'], LineType.DELETION))
+        else:
+          for j in interval:
+            fabric.delta.append(DiffLine(ctx[j]['line'], LineType.DELETION))
+        line_no = interval[-1] + 1
+
+    while line_no <= list(ctx.keys())[-1]:
+      fabric.delta.append(DiffLine(ctx[line_no]['line'], LineType.NOCHANGE))
+      line_no += 1
+
+    fabric.trim_delta()
+    return fabric
+
+  def create_alignments(self, actions, hunk, candidate):
     prompts = [f'''
-This is wrt the unified diff format. Here HUNK is given as:
+In unified diff format. This is HUNK:
 {hunk}
-~~~
-We are trying to be a little clever.  HUNK applies to the source code of some package PKG in versions X.
-Moreover, here is a section AREA of source code from PKG in version Y:
+It corresponds to a certain area of a package, which in another version is represented as CANDIDATE:
 {candidate.context_str()}
-~~~
-I produced AREA by a call to candidate.context_str(), which produces a representation that looks like:
-line_no\tmatch_type\tline_of_code (excluding whitespace) 
+CANDIDATE was produced by a call to candidate.context_str(), which produces a representation like:
+line_no\tmatch_type\tline_of_code (excluding whitespace)
 
-It's the same package, different versions. Here's the thing: you don't necessarily know whether X > Y, X == Y, or X < Y. Any of those could be true.
-Between versions, we might expect to see syntactic differences, variables renamed, brackets moved to separate lines, whitespace removed, etc. Obvi
-I did not cover all possible variations. But the main idea is HUNK and AREA represent the same area of the source code at different points in time.
+Now, let's try and weave the "actions" HUNK takes into CANDIDATE. Let's do this in two parts. 
 
-In a preprocessing step, we converted HUNK into a set of ACTIONs. An ACTION is defined as:
-INSERT: an unbroken sequence of code lines to be inserted between lines that already exist
-DELETE: every line of code that is deleted. Note that every line of code that is deleted counts as a DELETE, in contrast with INSERT which considers
-contiguous lines of code.
+Part 1:
 
-This is ACTIONS:
+An INSERTION action corresponds to a contiguous set of lines of code from HUNK that we want to inject into CANDIDATE. 
+Based on the fact that CANDIDATE and HUNK are the same area of source code at different points in time, 
+For each INSERTION action,
+After which line of CANDIDATE should that INSERTION action be performed?
+
+These are all actions:
 {'\n'.join([f"ACTION {i}:\n{str(action)}" for i, action in enumerate(actions)])}
-~~~
 
-Your course, simply, is to produce a mapping from action number to line number in candidate. If an ACTION is an INSERTION, the line number you pick is the line
-before which the INSERTION ACTION will begin. If an ACTION is a DELETION, the line number you pick is line that will be marked for DELETION. 
-
-IMPORTANT: lines may not match exactly, because who knows what changed between X and Y. That's why we're using you for this step in the process. We need you to 
-allow for some fuzziness in determining where to perform INSERTIONS and DELETIONS.
-
-Do be careful not to go too far off the reservation.
+Please just write your answer like a dictionary. So action_no -> line_no_in_candidate_to_insert_after
 ''',
-'''
-Now that you've generated your initial list, please invalidate your list. Use the following notes to explain why you may have made bad choices: 
-Notes:
-- What if an ACTION INSERTS code that is already present in AREA? We omit that ACTION from the output.
-- What if an ACTION DELETES code that is not present in AREA? We omit that ACTION from the output.
-- What if a refactor changed whether, for example, a stray curly bracket occurs on a standalone line or at the end of another, and as a consequence 
-  there is a DELETION for a single curly bracket? Do we ignore the CONTEXT (the surrounding lines) of the relevant DELETION? No, of course not. We remember
-  that the ACTION is not a standalone creature, and exists in the CONTEXT of HUNK, and we do not try to map ACTION to the wrong section of AREA. 
-- What if a line of code, like a method signature, was split across multiple lines, or condensed into one line, between X and Y versions? 
-
-I want you to be severe and harsh. You really have a habit of being too generous with yourself. Remember that we want to allow for fuzzy matching, but also remember
-that you are just a token matcher and you have a habit of making mistakes.
+f''',
+Ok, now let's do DELETIONS. Same deal, but important distinction: the lines to delete may have refactored over time. 
+So for your answer, please write ranges of code lines that correspond to each action. Like
+action_no -> (first_line_to_delete, last_line_to_delete)
 ''',
+f'''
+Ok, now please consolidate your dictionary.
 '''
-Now, please generate a final list based on your initial list, and your invalidations.
-'''
-]
-    out = '{ alignments: [ *give them in the same order as the ACTIONS occurred, and yield -1 if the ACTION is to be omitted* ] }'
+    ]
+    out = '{ alignments: { action_no: [context_line_or_lines (depending on insertion or deletion)] } }'
     return self.llm_layer(prompts, out, 'alignments')
-
 
   def semantic_pass(self, hunk, candidate_dict, cve_text):
 
@@ -230,8 +260,6 @@ Give me a final choice, or choices if case 2 holds.
 
     return self.llm_layer(prompts, out, 'best')
 
-
-
   def llm_layer(self, prompts, out, return_key):
     agent = Agent()
 
@@ -243,203 +271,27 @@ Give me a final choice, or choices if case 2 holds.
 
     for msg in agent.chain:
       for r,c in msg.items():
-        print(r)
-        print(c)
+        pass
+        #print(r)
+        #print(c)
 
     return yaml.safe_load(agent.chain[-1]['content'])[return_key]
   
-  # Bespoke diff calculation algorithm for the specific purpose of "fitting" patch code
-  #   to a different version of the same source code.
-  def old_fit(self, source_dir, cve_text):
-    for hunk in self.hunks:
-      fit_dict = hunk.compare_to(source_dir, HunkState.INITIAL)
-
-      if len(fit_dict) == 0:
-        print('Patch not applicable')
-        continue
-
-      #strongest_fit = possible_fits[0] if len(possible_fits) == 1 else max(possible_fits, key=lambda c: c.score)
-
-      delta = hunk.delta
-      
-      print('### DELTA ###')
-      for line in delta:
-        print(line)
-      print('###')
-      for f, C in fit_dict.items():
-        print(f)
-        for c in C:
-          print(c.context_str())
-
-      fits = []
-      for file, candidates in fit_dict.items():
-        for candidate in candidates:
-          target = candidate.context
-          #print('### TARGET ###')
-          #print(candidate.context_str())
-          #print('###')
-          ### START ###
-    
-          ### 1. Anchor Points ###
-          #
-          # Unique matches between the patch code and the source code. We originally
-          #   took advantage of these during candidate generation, and are re-using
-          #   them to establish "locality" or context for each section of a hunk. 
-          #
-          anchor_keys = sorted([k for k,v in target.items() if v['is_pattern']])
-          anchor_points = []
-          for target_ptr in range(len(anchor_keys)):
-            for delta_ptr in range((0 if len(anchor_points) == 0 else anchor_points[-1][1]), len(delta)):
-              #if delta[delta_ptr].text.strip() == target[anchor_keys[target_ptr]]['line'].strip():
-              if str_match(delta[delta_ptr].text.strip(), target[anchor_keys[target_ptr]]['line'].strip()):
-                anchor_points.append((anchor_keys[target_ptr], delta_ptr)) 
-                break
-    
-          print(anchor_points)
-    
-          ### 2. Segments ### 
-          #
-          # Subsections of the space between each anchor point. These are rectangular
-          #   because we're comparing patch code and source code, and are defined with
-          #   endpoints that correspond to all matches between the two texts. These
-          #   allow us to contextualize valid insertions from the patch code. 
-          #
-          segments = []
-          for i in range(len(anchor_points) - 1):
-            start_tpt, start_dpt = anchor_points[i]
-            end_tpt, end_dpt     = anchor_points[i + 1]
-            d = start_dpt
-            t = start_tpt
-           
-            ### 2a. Slats 
-            # 
-            # All matches between patch and source. Every line of code that isn't a match
-            #   is the "space" between slats. 
-            #
-            slats = []
-            collisions = {}
-            for j in range(start_tpt + 1, end_tpt):
-              tline = target[j]['line']
-              for k in range(start_dpt + 1, end_dpt):
-                dline = delta[k].text
-                if tline.strip() == dline.strip() and k not in collisions:
-                  slats.append((j, k))
-                  collisions[k] = True
-                  break # first match
-    
-            slats = [(start_tpt, start_dpt), *slats, (end_tpt, end_dpt)]
-            #print(slats)
-            for j in range(1, len(slats)):
-              prev = slats[j - 1]
-              cur = slats[j]
-              assert prev[0] < cur[0] and prev[1] < cur[1] # TODO violations of strict ascend
-              segments.append((prev, cur))
-              
-    
-          #print(segments)
-          ### 3. Hunk ###
-          #
-          # Segments composed of slats nicely translate to a hunk. Our only rules are:
-          #   - Segments are given by (start, end], except for the first which is [start, end]
-          #   - Slats are either NOCHANGE or DELETION depending on the state of the line in the patch code.
-          #   - Non-slats are either INSERTIONS from the patch code or NOCHANGE lines from the source code.
-          #   - The only context we have for how the new patch should be constructed is based on similarites
-          #       between patch and source, so we arbitrarily choose to do all INSERTIONS followed by all
-          #       NOCHANGES. 
-          #
-          adjusted = Hunk(file)
-          for idx, seg in enumerate(segments):
-            first = idx == 0
-            start_tpt, start_dpt = seg[0]
-            end_tpt, end_dpt     = seg[1]
-            def add_anchor(t, d):
-              adjusted.delta.append(DiffLine(target[t]['line'], LineType.DELETION if delta[d].line_type == LineType.DELETION else LineType.NOCHANGE))
-    
-            if first:
-              add_anchor(start_tpt, start_dpt)
-            for d in range(start_dpt + 1, end_dpt):
-              dline = delta[d]
-              if dline.line_type == LineType.INSERTION:
-                adjusted.delta.append(dline)
-    
-            for t in range(start_tpt + 1, end_tpt):
-              adjusted.delta.append(DiffLine(target[t]['line'], LineType.NOCHANGE))
-    
-            add_anchor(end_tpt, end_dpt)
-          #print(f'Before###\n{adjusted}\n###') 
-          ### 4. Context ###
-          #
-          # In unified format, the "context" of a hunk are the lines that come before
-          #   the first change. The default size of this area of the hunk is 3. Here
-          #   we either pad the top and bottom of the hunk with extra lines from the 
-          #   target space if we don't have 3 context lines on either side, or we 
-          #   prune context lines if there are more than 3 on either side to avoid
-          #   possible future overfitting were someone to use this patch in a different
-          #   context.
-          # 
-          top    = segments[0][0][0]  - 1 # first start_tpt
-          bottom = segments[-1][1][0]     # last  end_tpt
-          
-          changes = [i for i, diffline in enumerate(adjusted.delta) if diffline.line_type != LineType.NOCHANGE]
-          bottom_context_size = CONTEXT_LENGTH - (len(adjusted.delta) - 1 - changes[-1])
-          #print(bottom_context_size, len(adjusted.delta), changes[-1])
-          if (top_context_size := CONTEXT_LENGTH - changes[0]) > 0:
-            #print(top_context_size)
-            for _ in range(top_context_size):
-              adjusted.delta.insert(0, DiffLine(target[top]['line'], LineType.NOCHANGE))
-              top -= 1
-          elif top_context_size < 0:
-            adjusted.delta = adjusted.delta[abs(top_context_size) - 1:]
-          #print(adjusted)
-          if bottom_context_size > 0:
-            for _ in range(bottom_context_size):
-              adjusted.delta.append(DiffLine(target[bottom]['line'], LineType.NOCHANGE))
-              bottom += 1
-          elif bottom_context_size < 0:
-            adjusted.delta = adjusted.delta[:bottom_context_size]
-
-          adjusted.top = top
-          
- 
-          ### END ###
-          fits.append(adjusted)
-
-      for idx, fit in enumerate(fits):
-        print(f'### ADJUSTED ###\n{fit}\n###')
-        #if possible_fits[idx] == strongest_fit:
-        #  print(f'### ADJUSTED ###\n{adjusted}\n###')
-
-  def weave(self, candidate, original_hunk, actions):
-    fabric = Hunk(candidate.path_to)
-
 
   def generate_actions(self, original_hunk):
-
-    # Action generator. 
-    # An action is a delete or an insert. Deletes stand on their own, inserts are contiguous lines 
-    actions = []
-    current = None
+    actions, current = [], None
     for dl in original_hunk.delta:
-
-      match dl.line_type:
-        # A no change will only end INSERTIONS, not cause actions
-        case LineType.NOCHANGE:
-          if current is not None:
-            actions.append(current)
-            current = None
-        # INSERTIONS cause new actions or extend the current action
-        case LineType.INSERTION:
-          if current is None:
-            current = Action(ActionType.INSERTION, dl)
-          else:
-            current += dl 
-        # DELETIONS end current actions, cause a new action, and immediately end it
-        case LineType.DELETION:
-          if current is not None and current.action_type == ActionType.INSERTION:
-            actions.append(current)
-            current = None
-          actions.append(Action(ActionType.DELETION, dl))
-
+      if dl.line_type != LineType.NOCHANGE:
+        atype = ActionType.INSERTION if dl.line_type == LineType.INSERTION else ActionType.DELETION
+        if not current or current.action_type != atype:
+          if current: actions.append(current)
+          current = Action(atype, dl)
+        else:
+          current += dl
+      elif current:
+        actions.append(current)
+        current = None
+    if current: actions.append(current)
     return actions
 
 class Pattern:
@@ -574,6 +426,7 @@ class DiffLine:
 class Hunk:
 
   KILL_THRESHOLD = 4
+  MARGIN = 3
 
   # This is set heuristically. 
   PARTIAL_MATCH_SCORE = 30
@@ -604,6 +457,15 @@ class Hunk:
       ) 
       for line in self.raw_delta.split('\n')
     ]
+
+  def trim_delta(self):
+
+    first = next( (i for i, dl in enumerate(self.delta) if dl.line_type != LineType.NOCHANGE), None)
+    last  = next( (len(self.delta) - 1 - i for i, dl in enumerate(reversed(self.delta)) if dl.line_type != LineType.NOCHANGE), None) 
+
+    lhs_offset = first - self.MARGIN
+    self.delta = self.delta[lhs_offset:last + self.MARGIN + 1]
+    self.top += lhs_offset
 
   def to_a(self):
     return [line for line in self.delta if line.line_type in [LineType.NOCHANGE, LineType.DELETION]]
