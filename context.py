@@ -23,7 +23,11 @@ class ContextManager(Agent):
       self.declare_getter(key)
 
   def load_metadata(self):
-    return self.yaml_file_to_dict(self.driver_conf_path)
+    with open(self.driver_conf_path, 'r') as stream:
+      try:
+        return yaml.safe_load(stream)
+      except yaml.YAMLError as err:
+        raise err
       
   def save(self, key, value):
     if self.mode == 'r':

@@ -1,10 +1,14 @@
 #!/usr/bin/python3
 
-from common import Patch, HunkState, CVERecord
+from common import Patch, CVERecord
+from hunk import HunkState
 from agent import Agent
 import os
 import glob
 import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 # Control over representations of patches, staging and applying them. 
 # Needs information about what package to apply a patch to, or to triage
@@ -28,32 +32,32 @@ class PatchManager(Agent):
       cve_id = links[os.path.basename(patch_file)]
       self.patches.append(Patch(CVERecord(cve_id, descs[cve_id]), 'upstream', path_to=patch_file))
 
-    self.test()
+#    self.test()
 
-  def test(self):
-
-    clinks = self.ctx.get_candidate_links() if self.ctx.value_exists('candidate_links') else {}
-
-    for patch in self.patches:
-      print('~~~', patch.path_to, '~~~')
-      for release, package_home in self.ctx.get_package_homes().items():
-        print(release)
-        if release =='xenial':
-          adjusted_patch = Patch(patch.cve_record, 
-                                 release, 
-                                 fit_to=patch.with_metadata(clinks.get(release, {}).get(os.path.basename(patch.path_to), {})))
-          print(adjusted_patch)
-          #patch.fit(package_home, descs[patch.cve], metadata=clinks.get(release, {}).get(os.path.basename(patch.patch_file), {}))
-        #break # bionic test
-
-
-def main():
-  patcher = Patcher()
-  for patch in patcher.patches:
-    print(patch.patch_file)
-    for hunk in patch.hunks:
-      print(hunk.filename)
-      print(''.join(hunk.delta))
-
-if __name__=='__main__':
-  main() 
+#  def test(self):
+#
+#    clinks = self.ctx.get_candidate_links() if self.ctx.value_exists('candidate_links') else {}
+#
+#    for patch in self.patches:
+#      print('~~~', patch.path_to, '~~~')
+#      for release, package_home in self.ctx.get_package_homes().items():
+#        print(release)
+#        if release =='focal':
+#          adjusted_patch = Patch(patch.cve_record, 
+#                                 release, 
+#                                 fit_to=patch.with_metadata(clinks.get(release, {}).get(os.path.basename(patch.path_to), {})))
+#          print(adjusted_patch)
+#          #patch.fit(package_home, descs[patch.cve], metadata=clinks.get(release, {}).get(os.path.basename(patch.patch_file), {}))
+#        #break # bionic test
+#
+#
+#def main():
+#  patcher = Patcher()
+#  for patch in patcher.patches:
+#    print(patch.patch_file)
+#    for hunk in patch.hunks:
+#      print(hunk.filename)
+#      print(''.join(hunk.delta))
+#
+#if __name__=='__main__':
+#  main() 
