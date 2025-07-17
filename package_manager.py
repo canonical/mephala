@@ -4,6 +4,11 @@ import os
 import json
 import glob
 import sys
+import subprocess
+import logging
+import asyncio
+
+logging.basicConfig(level=logging.INFO)
 
 # Control of representations of packages including information about vulnerabilities and CVEs. 
 # The PatchManager could ask the PackageManager for the location of a given release, for example. 
@@ -45,6 +50,101 @@ class PackageManager(Agent):
     #  self.scrape_vulnerabilities()
     #  self.ctx.save('vulnerabilities', self.vulnerability_dict)
 
+  async def run_command(self, cmd, cwd, ignore_error=False):
+    try:
+      process = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+      )
+      stdout, stderr = await process.communicate()
+
+      if process.returncode != 0 and not ignore_error:
+        raise subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
+
+      return stdout.decode(), stderr.decode(), process.returncode
+    except subprocess.CalledProcessError as e:
+      logging.error(e)
+      sys.exit(1)
+
+  async def apply_patch_to(self, release, patch_path, dry_run=True):
+    pkg_home = self.ctx.get_package_homes().get(release, None)
+    if pkg_home is None:
+      raise ValueError("Release not in package homes")
+
+    # Commands to be executed
+    import_cmd = ["quilt", "import", "-f", patch_path]
+    push_cmd = ["quilt", "push"]
+    pop_cmd = ["quilt", "pop"]
+    delete_cmd = ["quilt", "delete", os.path.basename(patch_path)]
+
+    # Execute 'import' command
+    await self.run_command(import_cmd, pkg_home)
+
+    # Execute 'push' command
+    stdout, stderr, returncode = await self.run_command(push_cmd, pkg_home, ignore_error=True)
+
+    if dry_run:
+      if returncode == 0:
+        # In dry run, if push succeeds, pop and delete
+        await self.run_command(pop_cmd, pkg_home)
+      # Always delete in dry run
+      await self.run_command(delete_cmd, pkg_home)
+    else:
+      if returncode != 0:
+        # If push fails, only delete
+        logging.info(f"'quilt push' command had a non-zero return code {returncode}, handling it as expected.")
+        await self.run_command(delete_cmd, pkg_home)
+        sys.exit(1)
+      # If push succeeds in non-dry run, skip pop and delete
+      return stdout
+
+    return stdout
+
+  def old_apply_patch_to(self, release, patch_path, dry_run=True):
+    pkg_home = self.ctx.get_package_homes().get(release, None)
+    if pkg_home is None:
+      raise ValueError("Release not in package homes")
+
+    series = [
+      ["quilt", "import", patch_path],
+      ["quilt", "push"],
+      ["quilt", "pop"],
+      ["quilt", "delete", os.path.basename(patch_path)]
+    ]
+
+    # Import
+    try:
+      subprocess.run(["quilt", "import", "-f", patch_path], cwd=pkg_home, check=True)
+    except subprocess.CalledProcessError as e:
+      logging.error(e)
+      sys.exit(1)
+
+    # Push
+    try:
+      result = subprocess.run(["quilt", "push"], cwd=pkg_home, check=True, text=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+      pass     
+
+    if not dry_run:
+      return result.stdout
+
+    # Pop
+    try:
+      result = subprocess.run(["quilt", "pop"], cwd=pkg_home, check=True)
+    except subprocess.CalledProcessError as e:
+      logging.error(e)
+      sys.exit(1)
+
+    # Delete
+    try:
+      subprocess.run(["quilt", "delete", os.path.basename(patch_path)], cwd=pkg_home, check=True)
+    except subprocess.CalledProcessError as e:
+      logging.error(e)
+      sys.exit(1)
+
+    return f"{result.stdout}\n{result.stderr}"
 
   def scrape_vulnerabilities(self):
     # Initialize the dictionary

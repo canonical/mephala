@@ -1,0 +1,2 @@
+[console_scripts]
+mephala = mephala.cli.app:main

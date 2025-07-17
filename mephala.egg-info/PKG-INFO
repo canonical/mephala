@@ -1,0 +1,29 @@
+Metadata-Version: 2.4
+Name: mephala
+Version: 0.1.0
+Summary: AI-assisted patch back-porting
+Author-email: Julia Sarris <julia.sarris@canonical.com>
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: typer[all]>=0.12.0
+Requires-Dist: questionary>=2.0.1
+Requires-Dist: rich>=13.7.0
+Requires-Dist: openai>=1.25.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: intervaltree>=3.1.0
+Requires-Dist: fuzzywuzzy>=0.18.0
+Requires-Dist: python-levenshtein>=0.12.2
+Provides-Extra: dev
+Requires-Dist: ruff; extra == "dev"
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-asyncio; extra == "dev"
+
+# Mephala, the Webspinner
+## Security Update and Patch Management Infrastructure
+
+Make sure to include a .gpt-conf with the following structure:
+
+{
+"API_KEY": <openai_api_key>
+"MODEL": <model_name>
+}
