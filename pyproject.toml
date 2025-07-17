@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "mephala"
+version         = "0.1.0"
+description     = "AI-assisted patch back-porting"
+authors         = [{ name = "Julia Sarris", email = "julia.sarris@canonical.com" }]
+readme          = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    # ─── CLI ───────────────────────────────────────────
+    "typer[all]>=0.12.0",        
+    "questionary>=2.0.1",         
+    "rich>=13.7.0",                
+
+    # ─── AI / OpenAI ──────────────────────────────────
+    "openai>=1.25.0",
+
+    # ─── Patch analysis & utils ───────────────────────
+    "pyyaml>=6.0",
+    "intervaltree>=3.1.0",
+    "fuzzywuzzy>=0.18.0",
+    "python-levenshtein>=0.12.2",  
+
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",         
+    "pytest",        
+    "pytest-asyncio"
+]
+
+[project.scripts]
+mephala = "mephala.cli.app:main"
+
+[tool.setuptools.packages.find]
+include = ["mephala*"]
+exclude = [".venv*"]
+
+# Optional: include default config files packed inside the wheel
+[tool.setuptools.package-data]
+"mephala.config" = ["*.yaml", "*.json"]

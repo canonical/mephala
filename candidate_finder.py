@@ -73,7 +73,8 @@ class CandidateFinder:
       raise TypeError("hunk must have .to_b() method")
     if not hasattr(hunk, 'filename'):
       raise TypeError("hunk must have .filename attr")
-  
+ 
+    # possibility for a/b switch here depending on scoring heuristics used 
     pattern_lines = [line.text.strip() for line in hunk.to_b()]
     blacklist = set()
     psats = {}
