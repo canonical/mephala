@@ -13,8 +13,8 @@ internal state directly.
 from __future__ import annotations
 
 import textwrap
-import difflib
 import logging
+import re
 
 from mephala.core.models.enums      import HunkState, LineType, ActionType
 from mephala.core.models.diff_line  import DiffLine
@@ -98,15 +98,34 @@ class Hunk:
 
     # ---------------------------------------------------------------- clean-up
     def trim_delta(self):
-        first = next((i for i, dl in enumerate(self.delta) if dl.line_type != LineType.NOCHANGE), None)
-        last  = next((len(self.delta) - 1 - i for i, dl in enumerate(reversed(self.delta)) if dl.line_type != LineType.NOCHANGE), None)
+        """
+        Keep at most `MARGIN` unchanged lines before and after the first/
+        last edited line.  Works even when the hunk contains fewer than
+        `MARGIN` leading or trailing context lines.
+        """
+        first = next(
+            (i for i, dl in enumerate(self.delta)
+             if dl.line_type != LineType.NOCHANGE),
+            None
+        )
+        last = next(
+            (len(self.delta) - 1 - i for i, dl in enumerate(reversed(self.delta))
+             if dl.line_type != LineType.NOCHANGE),
+            None
+        )
         if first is None or last is None:
             raise GarbageCandidateError("Delta has only NOCHANGE lines")
-        lhs_off = first - self.MARGIN
-        self.delta = self.delta[lhs_off:last + self.MARGIN + 1]
+
+        # ----- clamp slice to valid list indices -------------------------
+        lhs_off   = max(first - self.MARGIN, 0)
+        rhs_limit = min(last  + self.MARGIN, len(self.delta) - 1)
+
+        # ----- apply slice ----------------------------------------------
+        self.delta = self.delta[lhs_off : rhs_limit + 1]
+
+        # adjust absolute top-line number of the hunk
         if self.top is not None:
             self.top += lhs_off
-
     # ---------------------------------------------------------------- actions
     def generate_actions(self) -> list[Action]:
         actions: list[Action] = []
@@ -160,23 +179,37 @@ class Hunk:
                 self._add_nochange(ctx, line_no)
                 line_no += 1
 
-            # ---------- INSERTION --------------------------------------
+            # ---------- INSERTION (single coordinate) ------------------
             if len(iv) == 1:
                 anchor = iv[0]
-                self._add_nochange(ctx, anchor)      # keep the anchor line
 
-                # desired left margin of the block
-                anchor_ws = len(ctx[anchor]["line"]) - len(ctx[anchor]["line"].lstrip(" \t"))
-                tpl_ws    = len(action.lines[0].text) - len(action.lines[0].text.lstrip(" \t"))
+                # The anchor might have been deleted earlier in *this* hunk.
+                # Walk upwards until we find a line that is still present.
+                while anchor not in ctx and anchor > ctx_keys[0]:
+                    anchor -= 1
 
-                for dl in action.lines:
-                    raw       = dl.text
-                    raw_ws    = len(raw) - len(raw.lstrip(" \t"))
-                    rel_ws    = raw_ws - tpl_ws                 # indentation relative to block start
-                    new_ws    = max(anchor_ws + rel_ws, 0)      # shift block to anchor column
-                    stripped  = raw.lstrip(" \t")
-                    new_text  = (" " * new_ws) + stripped
-                    self.delta.append(DiffLine(new_text, LineType.INSERTION))
+                # 0. unchanged anchor line first
+                if anchor >= line_no:
+                    self._add_nochange(ctx, anchor)
+
+                # 1. indentation – borrow from the first non-blank line below
+                look = anchor + 1
+                while look in ctx and ctx[look]["line"].strip() == "":
+                    look += 1
+                indent = re.match(r"[ \t]*",
+                                  ctx.get(look, {}).get("line", "")).group(0)
+
+                # 2. write insertion lines, but *skip* any line that would be
+                #    identical to the one that follows after we have finished
+                next_ctx_line = ctx.get(anchor + 1, {}).get("line", "").rstrip()
+
+                tpl_block = textwrap.dedent("\n".join(dl.text for dl in action.lines))
+                for raw in tpl_block.splitlines():
+                    candidate_line = f"{indent}{raw}"
+                    if candidate_line.rstrip() == next_ctx_line:
+                        # would duplicate the following context line – skip
+                        continue
+                    self.delta.append(DiffLine(candidate_line, LineType.INSERTION))
 
                 line_no = anchor + 1
 

@@ -12,18 +12,15 @@ Run through Typer:
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 
 import questionary
-from questionary import Choice
 from rich.console import Console
 
 from mephala.core.config.context_manager    import ContextManager
 from mephala.core.services.patch_manager    import PatchManager
 from mephala.core.services.package_manager  import PackageManager
 from mephala.core.services.candidate_finder import CandidateFinder
-from mephala.core.exceptions                import GarbageCandidateError
 from mephala.ai.backporter                  import Backporter
 
 from .utils import SaveTree, picker, confirm_action
@@ -107,6 +104,11 @@ def wizard_cmd():
         while not satisfied:
             bp        = Backporter(hunk, candidate, patch.meta.cve_record)
             new_hunk  = bp.run()
+            errs, tri = bp.get_reports()
+            if errs:
+                saver.save_text("\n".join(errs), name="struct_errors.txt")
+            if tri:
+                saver.save_text(tri, name="triage.diff")
 
             console.print("\n[bold cyan]=== Proposal Backport Hunk ===[/bold cyan]")
             console.print(str(new_hunk))
@@ -126,7 +128,7 @@ def wizard_cmd():
                 satisfied = True
             else:
                 # optional user feedback
-                rationale = questionary.text("What's wrong with it?").ask()
+                #rationale = questionary.text("What's wrong with it?").ask()
                 # feed rationale back into model by recreating Backporter
                 console.print("[yellow]Regenerating proposal…[/yellow]")
                 # simple strategy: keep the original Backporter but reset its

@@ -1,10 +1,9 @@
 from __future__ import annotations
-import os
+import re
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import questionary
-import typer
 from rich.console import Console
 from rich.prompt  import Prompt
 
@@ -15,28 +14,33 @@ ctx     = ContextManager()
 
 # ----------------------------------------------------------------------
 class SaveTree:
+    """
+    Helper that mirrors the nested “decision” tree on disk under
+    .metadata/, but also collects every patch fragment so we can stitch
+    them back together at the end of the run.
+    """
 
     BASE_DIR = ".metadata"
 
-    def __init__(self, overwrite: bool = False):
-        self.stack: List[str] = [str(ctx.cwd), self.BASE_DIR]
+    def __init__(self, overwrite: bool = False) -> None:
+        self.stack: List[str] = [self.BASE_DIR]
         self.overwrite = overwrite
-        self._mkdir(Path(*self.stack))
+        self._mkdir(self._path())
 
-    # low-level helpers -------------------------------------------------
-    def _mkdir(self, path: Path):
+    # ── basic filesystem helpers ──────────────────────────────────────
+    def _mkdir(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
     def _path(self) -> Path:
         return Path(*self.stack)
 
-    # directory traversal ----------------------------------------------
-    def drilldown(self, name: str):
+    # ── directory traversal ───────────────────────────────────────────
+    def drilldown(self, name: str) -> None:
         self.stack.append(name)
         self._mkdir(self._path())
 
-    def step_up(self):
-        if len(self.stack) > 2:
+    def step_up(self) -> None:
+        if len(self.stack) > 1:
             self.stack.pop()
 
     def dir_is_empty(self) -> bool:
@@ -45,28 +49,120 @@ class SaveTree:
         except FileNotFoundError:
             return True
 
-    # save helpers ------------------------------------------------------
-    def _write(self, filename: str, content: str):
+    # ── write helpers ─────────────────────────────────────────────────
+    def _write(self, filename: str, content: str) -> None:
         target = self._path() / filename
         if target.exists() and not self.overwrite:
             console.print(f"[yellow]SKIP[/yellow] would overwrite {target}")
             return
         target.write_text(content)
 
-    def save_hunk(self, hunk, *, name="auto.patch"):
-        self._write(name, f"{hunk}\n")
+    def save_hunk(self, hunk, *, name: str = "auto.patch") -> None:
+        text = f"{hunk}\n"
+        self._write(name, text)
 
-    def save_choices(self, cand_dict, *, name="choices.txt"):
+    def save_choices(self, cand_dict, *, name: str = "choices.txt") -> None:
         body = ""
-        for i, cand in enumerate(sorted(cand_dict.values(), key=lambda c: -c.score), 1):
+        for i, cand in enumerate(sorted(cand_dict.values(),
+                                        key=lambda c: -c.score), 1):
             body += f"Candidate {i} (score {cand.score}):\n"
             body += f"path: {cand.path_to}\n"
             body += "\n".join(cand.lines())
             body += "\n---\n"
         self._write(name, body)
 
-    def mark_unresolved(self, reason: str, *, name="unresolved.txt"):
+    def mark_unresolved(self, reason: str, *, name: str = "unresolved.txt"):
         self._write(name, reason)
+
+    def save_trace(self, trace, *, name="trace.json"):
+        from json import dumps
+        self._write(name, dumps([t.__dict__ for t in trace], indent=2))
+
+    def save_text(self, content: str, *, name: str):
+        self._write(name, content)
+
+    # ───────────────────────────────────────────────── finalizer
+    def finalize_patch(self,
+                       upstream_patch: str,
+                       release: str,
+                       *,
+                       overwrite: bool = True) -> Path:
+        """
+        Scan all hunk-directories (1h/, 2h/, …), read every *.patch found
+        there, order them numerically and stitch the lot – together with
+        the original header – into a single composite patch.
+
+        The file is written to
+            .metadata/<patch-name>/<release>/<original-name>.patch
+        and the absolute path is returned.
+
+        It is safe to call this repeatedly: the file is rewritten at
+        each call unless `overwrite` is set to False.
+        """
+        from pathlib import Path
+
+        out_dir = self._path()                     # …/<patch>/<release>
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / Path(upstream_patch).name
+
+        if out_path.exists() and not overwrite:
+            return out_path
+
+        # ---------- 1. gather fragments from disk ----------
+        fragment_pairs: list[tuple[int, str]] = []
+        hunk_dir_rx = re.compile(r"^(\d+)[a-z]*$")     # '1h', '10h', …
+
+        for item in out_dir.iterdir():
+            if not item.is_dir():
+                continue
+            m = hunk_dir_rx.match(item.name)
+            if not m:
+                continue
+            seq_no = int(m.group(1))
+            for frag_file in sorted(item.glob("*.patch")):
+                fragment_pairs.append((seq_no, frag_file.read_text()))
+
+        # order by the recorded / directory sequence number
+        fragments = [txt for _seq, txt in sorted(fragment_pairs, key=lambda p: p[0])]
+
+        # ---------- 2. copy upstream header ----------
+        header_lines: list[str] = []
+        with open(upstream_patch, "r") as fp:
+            for ln in fp:
+                if ln.startswith("--- "):          # first file header – stop
+                    break
+                header_lines.append(ln.rstrip("\n"))
+
+        # ---------- 3. banner ----------
+        banner = [
+            f"Back-ported to release {release} by Mephala.",
+            "This patch is partially auto-generated by Mephala.",
+            "",
+            "Original header follows:",
+            "",
+        ]
+
+        # 4. write out  -------------------------------------------------
+        seen_headers: set[str] = set()
+        with open(out_path, "w") as out:
+            out.write("\n".join(banner))
+            out.write("\n".join(header_lines))
+            out.write("\n\n")
+
+            header_rx = re.compile(r"^(--- .+?\n\+\+\+ .+?\n)")
+            for frag in fragments:
+                # keep only the FIRST header for a given path
+                m = header_rx.match(frag)
+                if m:
+                    hdr = m.group(1)
+                    if hdr in seen_headers:
+                        frag = frag.replace(hdr, "", 1)
+                    else:
+                        seen_headers.add(hdr)
+                out.write(frag if frag.endswith("\n") else frag + "\n")
+
+        return out_path
+
 
 # ----------------------------------------------------------------------
 # small UI helpers

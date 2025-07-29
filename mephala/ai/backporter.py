@@ -6,26 +6,22 @@ represents the proposed backport.
 """
 from __future__ import annotations
 import logging
-import os
-import textwrap
-import difflib
 from pathlib import Path
 
 from mephala.ai.agent          import Agent
-from mephala.core.models.enums import ActionType
-from mephala.core.models.diff_line import DiffLine
 from mephala.core.models.action    import Action
 from mephala.core.models.candidate import Candidate
 from mephala.core.models.cve_record import CVERecord
 from mephala.core.diff.hunk        import Hunk
 from mephala.core.exceptions       import GarbageCandidateError
+from mephala.core.utils.patch_checks import validate_structure, triage_diff, is_patch_well_formed
 
 log = logging.getLogger(__name__)
 
 
 class Backporter:
     """
-    Orchestrates the old create_backport() pipeline.
+    Backport pipeline orchestration.
     """
 
     def __init__(self, hunk: Hunk, candidate: Candidate, cve: CVERecord):
@@ -33,15 +29,46 @@ class Backporter:
         self.candidate = candidate
         self.cve       = cve
         self.agent     = Agent()   # singleton
+        self.struct_errors: list[str] = []
+        self.triage_report: str = ""
 
     # ─────────────────────────────────────────────── public
     def run(self) -> Hunk:
-        draft = self._draft_backport()
-        actions = self.hunk.generate_actions()
-        prune   = self._prune_actions(actions)
-        align   = self._align_actions(prune)
-        new_hunk = self._weave(align)
-        return new_hunk
+        try:
+            draft = self._draft_backport()
+    
+            if not draft.strip():
+                raise GarbageCandidateError("LLM produced empty draft")
+    
+            actions = self.hunk.generate_actions()
+            prune   = self._prune_actions(actions)
+            align   = self._align_actions(prune)
+            new_hunk = self._weave(align)
+            # ─────────────── validation / triage ──────────────────────────
+            self.struct_errors = validate_structure(self.hunk, str(new_hunk))
+            self.triage_report = triage_diff(self.hunk, new_hunk, self.candidate)
+    
+            # optional: let the LLM try a one-shot “fix” when the only complaint is indentation
+            if self.struct_errors and all("indent" in e.lower() for e in self.struct_errors):
+                patch_txt = str(new_hunk)
+                fix_prompt = (
+                    "The following unified diff is syntactically broken (indentation only).\n"
+                    "Please output a *corrected* diff – same filename, keep exact code.\n"
+                    "```diff\n" + patch_txt + "\n```"
+                )
+                try:
+                    fixed = self.agent.ask(fix_prompt, pattern="diff", stage="repair_structure")
+                    if is_patch_well_formed(fixed):
+                        from mephala.core.diff.hunk import Hunk
+                        new_hunk = Hunk.from_diff_lines(fixed.splitlines(), new_hunk.filename)
+                        self.struct_errors = validate_structure(self.hunk, str(new_hunk))
+                except Exception:
+                    # even if the LLM fails we keep the original new_hunk
+                    pass
+            return new_hunk
+        finally:
+            Agent().new_session()
+
 
     # ─────────────────────────────────────────────── steps
     # 1. draft with LLM
@@ -63,32 +90,110 @@ Preserve indentation – do not left-justify.
 
 Respond only with ```{pattern}``` fenced code.
 """
-        return self.agent.ask(prompt, pattern=pattern)
+        return self.agent.ask(prompt, pattern=pattern, stage="draft_backport")
+
 
     # 2. prune actions via LLM
     def _prune_actions(self, actions: list[Action]) -> list[Action]:
+        """
+        Decide which actions generated from the template hunk should be
+        deleted **before** we attempt to align/weave them.
+
+        Strategy
+        --------
+        1.  Ask the LLM to classify every target action as
+               identical | opposites | irrelevant | other
+            and to signal mismatching variable sets.
+
+        2.  Keep only the YAML items that *request deletion* according to
+            the rules in the prompt.
+
+        3.  Verify “opposites” really come in pairs that touch (nearly)
+            identical text.  Downgrade bogus labels to 'other'.
+
+        4.  If the pruning step would wipe out every action, fall back to
+            the original list and log a warning – we never want to enter
+            the alignment stage with an empty set.
+        """
+        # ─── 0. build input dictionaries ────────────────────────────────
         tpl = {f"t.{i}": a for i, a in enumerate(actions)}
-        tgt = {f"0-{i}": a for i, a in enumerate(actions)}  # self-diff template
-        yaml = self.agent.ask(
-            f"""
-You have two ordered dicts:
+        tgt = {f"0-{i}": a for i, a in enumerate(actions)}   # self-diff template
 
-template: {self._dict_str(tpl)}
-target  : {self._dict_str(tgt)}
+        prompt = f"""
+You are reviewing two patch action sequences, each represented as an ordered dictionary:
+- The *template sequence* (original patch actions): {self._dict_str(tpl)}
+- The *target   sequence* (actions generated by attempting to back-port): {self._dict_str(tgt)}
 
-Mark any target actions that are 'irrelevant' or 'opposites'.
-Return YAML:
+For each **target** action decide whether it should be removed from the
+sequence.
+
+Definitions
+  identical  – code text is effectively the same (ignore whitespace)
+  opposites  – one action deletes and another inserts *the same* text
+  irrelevant – touches unrelated code
+  other      – none of the above
+
+Return YAML with this schema (strict YAML, no commentary):
+
 metadata:
   <target_id>:
-    label: <irrelevant|opposites|other>
-""",
+    template_match: <template_id | ~>
+    label        : <irrelevant|opposites|identical|other>
+    tpl_vars     : [foo, bar]   # variables in matched template action (can be [])
+    tgt_vars     : [foo, bar]   # variables in target action           (can be [])
+
+Only include items that SHOULD BE DELETED, i.e.
+  • label is 'irrelevant' or 'opposites', OR
+  • template_match is ~, OR
+  • tpl_vars and tgt_vars differ as sets.
+"""
+        yaml = self.agent.ask(
+            prompt,
             output_format="yaml",
+            stage="prune_actions"
         )
-        delete_ids = [
-            k for k, meta in yaml.get("metadata", {}).items()
-            if meta.get("label") in ("irrelevant", "opposites")
+
+        meta = yaml.get("metadata", {}) or {}
+
+        # ─── 1. helper to normalise a block of text ─────────────────────
+        def _norm(a: Action) -> str:
+            return " ".join(
+                ln.text.strip().lower() for ln in a.lines
+            )
+
+        # ─── 2. verify ‘opposites’ really form pairs with same text ────
+        norm_map = {aid: _norm(tgt[aid]) for aid in tgt}
+        for aid, info in list(meta.items()):
+            if info.get("label") != "opposites":
+                continue
+            twin   = next(
+                (o for o, inf in meta.items()
+                 if o != aid and inf.get("label") == "opposites"
+                 and norm_map.get(o) == norm_map.get(aid)),
+                None
+            )
+            if not twin:                     # lonely or mismatching – downgrade
+                meta[aid]["label"] = "other"
+
+        # ─── 3. build new action list  ──────────────────────────────────
+        delete_ids = {
+            k for k, m in meta.items()
+            if m.get("label") in ("irrelevant", "opposites")
+            or m.get("template_match") in (None, "~")
+        }
+
+        pruned = [
+            a for idx, a in enumerate(actions)
+            if f"0-{idx}" not in delete_ids
         ]
-        return [a for idx, a in enumerate(actions) if f"0-{idx}" not in delete_ids]
+
+        # ─── 4. never return an empty list  ─────────────────────────────
+        if not pruned:
+            log.warning("[prune_actions] pruning removed all actions – "
+                        "using originals instead")
+            pruned = actions
+
+        return pruned
 
     # 3. align actions via LLM
     def _align_actions(self, actions: list[Action]):
@@ -139,6 +244,7 @@ alignments:
     delete_to:   # ~ if an INSERTION, otherwise the last line number to delete.
 """,
             output_format="yaml",
+            stage="align_actions"
         )
 
         # ─────────────── normalise & validate YAML → list[{'action', 'interval'}]
@@ -173,9 +279,38 @@ alignments:
 
     # 4. weave & produce new Hunk
     def _weave(self, threads):
-        new_hunk = Hunk(self.hunk.filename) 
+        """
+        Build the back-ported hunk and give it the path of the file in
+        which the candidate was found.  Overlapping DELETE/INSERT pairs
+        are normalised first so we never clone a line we are about to
+        remove.
+        """
+        from pathlib import Path
+
+        # 0. normalize execution order / anchors
+        threads = self._normalize_threads(threads)
+
+        # 1. derive a relative path that matches the depth of the
+        #    upstream filename but definitely exists in the target tree
+        cand_path     = Path(self.candidate.path_to)
+        upstream_tail = Path(self.hunk.filename)
+        parts_needed  = len(upstream_tail.parts)
+        rel_path      = Path(*cand_path.parts[-parts_needed:])
+
+        # 2. weave the actions against the candidate’s context
+        new_hunk = Hunk(str(rel_path))
         new_hunk.weave(self.candidate, threads)
         return new_hunk
+
+    # ───────────────────────────────────────── public helpers
+    def get_reports(self):
+        """
+        Returns (structural_error_list, triage_diff_string) and resets them
+        so each Backporter instance is read exactly once.
+        """
+        errs, tri = self.struct_errors, self.triage_report
+        self.struct_errors, self.triage_report = [], ""
+        return errs, tri
 
     # ─────────────────────────────────────────────── tiny utils
     @staticmethod
@@ -191,3 +326,52 @@ alignments:
             ".js": "javascript",
             ".java": "java",
         }.get(ext.lower(), "text")
+
+    @staticmethod
+    def _normalize_threads(threads: list[dict]) -> list[dict]:
+        """
+        Return a *new* thread list that the weaver can execute in one forward
+        pass without duplicating lines.
+    
+        Steps performed
+        1. For every INSERTION whose anchor k satisfies
+               d_from - 1 ≤ k ≤ d_to
+           of some DELETION [d_from, d_to],
+           move the anchor to d_to (last line of the block).
+    
+        2. Re-order the list so that
+             • all DELETION blocks appear first, ascending by d_from,
+               each immediately followed by its rewritten INSERTIONs
+             • all remaining INSERTIONs follow, ascending by anchor.
+    
+        3. Do **not** modify any interval except the anchor rewrite in (1).
+           The original list object is left untouched (deep-copy semantics).
+    
+        The resulting list fulfils the invariant:
+            walking candidate lines upward (low → high) and executing the
+            actions in the returned order never encounters a reference to a
+            line that has already been deleted.
+        """
+        deletions, insertions = [], []
+    
+        for t in threads:
+            (deletions if len(t["interval"]) == 2 else insertions).append(t)
+    
+        ordered: list[dict] = []
+    
+        for d in sorted(deletions, key=lambda t: t["interval"][0]):
+            d_from, d_to = d["interval"]
+            ordered.append(d)
+    
+            victims = [
+                ins for ins in insertions
+                if d_from - 1 <= ins["interval"][0] <= d_to
+            ]
+            for ins in victims:
+                ins["interval"][0] = d_to         
+            ordered.extend(victims)
+    
+            insertions = [i for i in insertions if i not in victims]
+    
+        ordered.extend(sorted(insertions, key=lambda t: t["interval"][0]))
+        return ordered

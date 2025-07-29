@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import glob
-import json
 import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +85,16 @@ class PackageManager:
 
         Returns stdout of `quilt push` (even in dry-run mode).
         """
+
+        # Guard only the hunks produced by Mephala itself – they always live
+        # somewhere beneath .metadata/
+        from mephala.core.utils.patch_checks import is_patch_well_formed
+        if ".metadata" in Path(patch_path).parts:
+            if not is_patch_well_formed(Path(patch_path).read_text()):
+                raise RuntimeError(
+                    f"{patch_path} looks malformed – aborting; inspect struct_errors.txt"
+                )
+
         pkg_home = self.ctx.get_package_homes().get(release)
         if not pkg_home:
             raise ValueError(f"Unknown release '{release}'")
@@ -148,7 +157,7 @@ class PackageManager:
     
         if not capture:
             return "", "", proc.returncode
-        return stdout, stderr, proc.returncode
+        return stdout, stderr, int(proc.returncode)
 
     # ════════════════════════════════════════════════════════════════════
     #                    OPTIONAL:  vulnerability scrape

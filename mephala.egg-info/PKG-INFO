@@ -17,6 +17,9 @@ Provides-Extra: dev
 Requires-Dist: ruff; extra == "dev"
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: pytest-asyncio; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: pytest-mock; extra == "dev"
+Requires-Dist: tox; extra == "dev"
 
 # Mephala, the Webspinner
 ## Security Update and Patch Management Infrastructure

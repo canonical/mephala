@@ -1,12 +1,15 @@
 from __future__ import annotations
 import math
 from itertools import islice
-from typing import List, Dict
+from typing import List, Dict, Any
 
 from .pattern   import Pattern
-from .diff_line import DiffLine
 
 class Candidate:
+    earliest_hit: int
+    latest_hit: int
+    context: Dict[int, Dict[str, Any]]
+
     def __init__(self, target_length: int, *patterns: Pattern,
                  extent=None, score=1):
         self.patterns      = list(patterns)
@@ -59,8 +62,11 @@ class Candidate:
         return [m["line"] for m in self.context.values()]
 
     def context_str(self):
-        mk = lambda k, v: f"{k}\t{'Part' if v['is_partial'] else 'Full' if v['is_pattern'] else 'Miss'}\t{v['line']}"
-        return "\n".join(mk(k, v) for k, v in self.context.items())
+        def _mk(k: int, v: dict[str, str]) -> str:
+            kind = "Part" if v["is_partial"] else "Full" if v["is_pattern"] else "Miss"
+            return f"{k}\t{kind}\t{v['line']}"
+
+        return "\n".join(_mk(k, v) for k, v in self.context.items())
 
     def __str__(self):
         return f"Candidate({self.path_to}, score={self.score})"

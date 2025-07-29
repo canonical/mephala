@@ -7,7 +7,6 @@ helpers taken from cli.utils.
 from __future__ import annotations
 
 import asyncio
-import os
 from enum import Enum, auto
 from pathlib import Path
 
@@ -23,7 +22,7 @@ from mephala.core.models.diff_line            import DiffLine
 from mephala.core.diff.hunk                   import Hunk
 from mephala.ai.backporter                    import Backporter
 
-from .utils import SaveTree, picker, confirm_action
+from .utils import SaveTree, picker
 
 console = Console()
 ctx     = ContextManager()
@@ -126,6 +125,7 @@ def auto_wizard_cmd():
             cand_dict = CandidateFinder.generate_candidate_dictionary(
                 hunk, releases[release], single=single
             )
+            saver.save_choices(cand_dict)
             if not cand_dict:
                 saver.mark_unresolved("No candidate found")
             else:
@@ -134,15 +134,27 @@ def auto_wizard_cmd():
                     saver.mark_unresolved("No high-confidence candidate")
                 else:
                     try:
-                        new_hunk = Backporter(hunk, best, patch.meta.cve_record).run()
+                        bp = Backporter(hunk, best, patch.meta.cve_record)
+                        new_hunk = bp.run()
+                        errs, tri = bp.get_reports()
+                        if errs:
+                            saver.save_text("\n".join(errs), name="struct_errors.txt")
+                        if tri:
+                            saver.save_text(tri, name="triage.diff")
                         saver.save_hunk(new_hunk)
-                        saver.save_choices(cand_dict)
-                    except GarbageCandidateError:
+                        saver.save_trace(bp.agent.get_trace())
+                    except GarbageCandidateError as exc:
+                        saver.save_trace(bp.agent.get_trace())
+                        saver.save_text(str(exc), name="exception.txt")
                         saver.mark_unresolved("Bad candidate produces garbage")
 
         saver.step_up()
 
     console.print("[green]AUTO back-port completed![/green]")
+
+    # ------------------------------------------------------- compose patch
+    final_path = saver.finalize_patch(patch_path, release)
+    console.print(f"[bold green]Combined patch written to {final_path}[/bold green]")
 
 # ----------------------------------------------------- misc helper
 def _fix_hunk_fuzz(hunk: Hunk, cand, fuzz: int = 3) -> Hunk:
@@ -150,8 +162,8 @@ def _fix_hunk_fuzz(hunk: Hunk, cand, fuzz: int = 3) -> Hunk:
     Replaces the first/last `fuzz` context lines of the hunk with lines
     from the candidate slice.
     """
-    top_ctx  = cand.lines[:fuzz]
-    bot_ctx  = cand.lines[-fuzz:] if fuzz else []
+    top_ctx  = cand.lines()[:fuzz]
+    bot_ctx  = cand.lines()[-fuzz:] if fuzz else []
     mid_part = hunk.to_b()[fuzz : len(hunk.to_b()) - fuzz or None]
 
     new_lines = (

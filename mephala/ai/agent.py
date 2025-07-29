@@ -28,13 +28,21 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
 from openai import OpenAI
+from openai import (
+    RateLimitError,
+    APIConnectionError,
+    APITimeoutError,
+    APIStatusError,  
+)
 
 from mephala.core.exceptions import StructuredParseError
+from mephala.ai.types import InvocationRecord 
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler()) 
@@ -72,6 +80,7 @@ class Agent(metaclass=_SingletonMeta):
         self._messages: List[Dict[str, str]] = []
         self._init_done = True
         log.debug("OpenAI Agent initialised with model %s", self.model)
+        self._recorder: list[InvocationRecord] = []
 
     # ---------------------------------------------------------------- public
     # ---- session control
@@ -84,25 +93,64 @@ class Agent(metaclass=_SingletonMeta):
         self,
         prompt: str,
         *,
-        pattern: Optional[str] = None,
-        output_format: Optional[str] = None,
+        pattern: str | None = None,
+        output_format: str | None = None,
         return_key: str | None = None,
         temperature: float = 0.5,
+        stage: str = "generic",  
+        keep_session: bool = False 
     ) -> Any:
         """
-        • If `output_format` is given, the answer is expected to be
-          YAML/JSON and is parsed + type-coerced.
-        • Otherwise, optionally extract a ```<pattern> fenced code block.
+        High-level helper around chat-completion.
+    
+        • If `output_format` is given, the answer is expected to be YAML/JSON
+          and will be parsed + type-coerced.
+        • Otherwise, optionally extracts a fenced code block matching
+          `pattern`.
+        • Every invocation is recorded in `self._recorder` as an
+          InvocationRecord (prompt, parameters, raw answer, parsed artefact…).
         """
-        self._make_request(prompt, temperature=temperature)
+        inv = InvocationRecord(
+            stage=stage,
+            prompt=prompt,
+            params=dict(
+                pattern=pattern,
+                output_format=output_format,
+                return_key=return_key,
+                temperature=temperature,
+            ),
+        )
+    
+        try:
+            # ───── first request ───────────────────────────────────────────
+            self._make_request(prompt, temperature=temperature)
+    
+            # ───── structured answer path ─────────────────────────────────
+            if output_format:
+                parsed = self._format_completion(output_format)
+                inv.parsed = parsed
+                inv.taken_path = "structured"
+                result = parsed if return_key is None else parsed.get(return_key)
+    
+            # ───── free-form answer path ──────────────────────────────────
+            else:
+                result = self._filter_output(pattern)
+                inv.taken_path = "free_form"
+    
+            return result
+    
+        finally:
+            if self._messages:
+                inv.raw_answer = self._messages[-1]["content"]
+            self._recorder.append(inv)
 
-        # structured-answer path
-        if output_format:
-            parsed = self._format_completion(output_format)
-            return parsed if return_key is None else parsed.get(return_key)
+            if not keep_session:
+                self.new_session()
 
-        # free-form answer, maybe fenced code extraction
-        return self._filter_output(pattern)
+    def get_trace(self) -> list[InvocationRecord]:
+        """Return and clear trace, caller becomes owner"""
+        trace, self._recorder = self._recorder, []
+        return trace
 
     # ---------------------------------------------------------------- internals
     # ---- configuration
@@ -125,16 +173,49 @@ class Agent(metaclass=_SingletonMeta):
             raise RuntimeError("OpenAI API key not provided (env or .gpt-conf)")
 
     # ---- chat plumbing
-    def _make_request(self, prompt: str, *, temperature: float = 0.5) -> str:
+    def _make_request(
+        self, prompt: str, *, temperature: float = 0.5, max_retries: int = 5
+    ) -> str:
         log.info("[Agent] Prompting model %s (len=%d)", self.model, len(prompt))
         self._messages.append({"role": "user", "content": prompt})
-        resp = self.client.chat.completions.create(
-            model=self.model, messages=self._messages, temperature=temperature
-        )
-        msg = resp.choices[-1].message
-        self._messages.append({"role": msg.role, "content": msg.content})
-        return msg.content
 
+        backoff = 1          # seconds; will double each retry
+        last_err = None      # <-- remember the last caught error
+        for attempt in range(max_retries):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=self._messages,
+                    temperature=temperature,
+                )
+                msg = resp.choices[-1].message
+                self._messages.append({"role": msg.role, "content": msg.content})
+                return msg.content
+
+            except (
+                RateLimitError,
+                APIConnectionError,
+                APITimeoutError,
+                APIStatusError,
+            ) as exc:
+                last_err = exc                       # <-- keep it
+                retry_after = getattr(exc, "retry_after", None) or (
+                    float(exc.response.headers.get("retry-after", 0))
+                    if getattr(exc, "response", None) else 0
+                )
+                wait = retry_after or backoff
+                log.warning(
+                    "OpenAI error (%s). Retrying in %.1fs …",
+                    exc.__class__.__name__, wait
+                )
+                time.sleep(wait)
+                backoff = min(backoff * 2, 60)
+                continue
+
+        # -------- exhausted retries ----------------------------------------
+        log.error("Giving up after %d retries (last error: %s)", max_retries, last_err)
+        raise last_err if last_err else RuntimeError("OpenAI request failed")
+    
     # ---- structured answer helpers
     def _format_completion(self, output_format: str):
         # ask for explicit YAML re-statement

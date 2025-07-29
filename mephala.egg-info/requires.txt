@@ -11,3 +11,6 @@ python-levenshtein>=0.12.2
 ruff
 pytest
 pytest-asyncio
+pytest-cov
+pytest-mock
+tox

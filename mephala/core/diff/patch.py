@@ -1,5 +1,4 @@
 from __future__ import annotations
-import os
 from typing import List
 
 from mephala.core.models.diff_line  import DiffLine
@@ -31,14 +30,15 @@ class Patch:
         a_filename: str | None = None
         b_filename: str | None = None
         collecting_filenames   = False
-    
-        conv = lambda l: "/".join(l.split(" ")[1].split("/")[1:]).strip()
+
+        def _conv(header_line: str) -> str:
+            return "/".join(header_line.split(" ")[1].split("/")[1:]).strip()    
     
         for line in lines:
             # ----- new file header ('--- a/…')
             if line.startswith("---"):
                 try:
-                    a_filename = conv(line)
+                    a_filename = _conv(line)
                     collecting_filenames = True
                 except IndexError:
                     continue
@@ -47,7 +47,7 @@ class Patch:
             elif line.startswith("+++"):
                 if not collecting_filenames:
                     continue
-                b_filename = conv(line)
+                b_filename = _conv(line)
                 if a_filename != b_filename:
                     # mismatch usually means rename; still use b_filename
                     pass

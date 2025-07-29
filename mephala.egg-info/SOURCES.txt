@@ -9,6 +9,7 @@ mephala.egg-info/requires.txt
 mephala.egg-info/top_level.txt
 mephala/ai/agent.py
 mephala/ai/backporter.py
+mephala/ai/types.py
 mephala/cli/app.py
 mephala/cli/auto_wizard.py
 mephala/cli/utils.py
@@ -29,3 +30,4 @@ mephala/core/services/candidate_finder.py
 mephala/core/services/package_manager.py
 mephala/core/services/patch_manager.py
 mephala/core/utils/logging.py
+mephala/core/utils/patch_checks.py

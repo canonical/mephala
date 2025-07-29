@@ -1,4 +1,4 @@
-from .enums import ActionType, LineType
+from .enums import ActionType
 from .diff_line import DiffLine
 
 class Action:

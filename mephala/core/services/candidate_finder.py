@@ -23,7 +23,7 @@ import logging
 import os
 from typing import Dict, List
 
-from intervaltree import Interval, IntervalTree
+from intervaltree import IntervalTree
 from fuzzywuzzy import fuzz
 
 from mephala.core.models import Pattern, Candidate
@@ -128,7 +128,7 @@ class CandidateFinder:
         if not hasattr(hunk, "filename"):
             raise TypeError("hunk must have .filename attr")
 
-        pattern_lines = [l.text.strip() for l in hunk.to_b()]
+        pattern_lines = [line.text.strip() for line in hunk.to_b()]
         blacklist: set[str] = set()
         psats: dict[str, int] = {}
         candidates: dict[str, List[Candidate]] = {}
